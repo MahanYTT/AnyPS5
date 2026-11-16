@@ -1,4 +1,5 @@
 #include "prx/libSceFreeTypeOt/include/OutlineTransform.hpp"
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -6,6 +7,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -119,11 +126,139 @@ void Embolden() {
             "an overflowing product throws its own error unchanged");
 }
 
+struct GuardedPage {
+    void* base = nullptr;
+    std::size_t size = 0;
+
+    GuardedPage() {
+#ifdef _WIN32
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        size = info.dwPageSize;
+        base = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+        base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) base = nullptr;
+#endif
+        Require(base != nullptr, "guarded page allocates");
+    }
+
+    ~GuardedPage() {
+        if (!base) return;
+#ifdef _WIN32
+        VirtualFree(base, 0, MEM_RELEASE);
+#else
+        munmap(base, size);
+#endif
+    }
+
+    template <typename T>
+    T* As() const {
+        return static_cast<T*>(base);
+    }
+
+    void SetReadOnly() const {
+#ifdef _WIN32
+        DWORD previous = 0;
+        Require(VirtualProtect(base, size, PAGE_READONLY, &previous) != 0, "guarded page becomes read-only");
+#else
+        Require(mprotect(base, size, PROT_READ) == 0, "guarded page becomes read-only");
+#endif
+    }
+};
+
+template <typename TCall>
+bool ThrowsPreservingErrno(TCall call) {
+    errno = 71;
+    try {
+        call();
+    } catch (const std::runtime_error&) {
+        return errno == 71;
+    }
+    return false;
+}
+
+void GuestPointers() {
+    Shape shape({{64, 0}, {0, 128}}, {1});
+    const GuestMatrix shear{0x10000, 0x8000, -0x4000, 0x20000};
+    const auto* badConstOutline = reinterpret_cast<const GuestOutline*>(std::uintptr_t{0x10});
+    auto* badOutline = reinterpret_cast<GuestOutline*>(std::uintptr_t{0x10});
+    const auto* badMatrix = reinterpret_cast<const GuestMatrix*>(std::uintptr_t{0x10});
+    auto* badPoints = reinterpret_cast<GuestVector*>(std::uintptr_t{0x10});
+    auto* badContours = reinterpret_cast<std::uint16_t*>(std::uintptr_t{0x10});
+
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtOutlineTransform_nid_no_patch(badConstOutline, &shear); }),
+            "transform rejects an unmapped outline without changing errno");
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtOutlineTransform_nid_no_patch(&shape.outline, badMatrix); }) &&
+                shape.Is({{64, 0}, {0, 128}}),
+            "transform rejects an unmapped matrix without changing points or errno");
+
+    Shape unmappedPoints({{1, 2}}, {0});
+    unmappedPoints.outline.points = badPoints;
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtOutlineTransform_nid_no_patch(&unmappedPoints.outline, &shear); }),
+            "transform rejects unmapped points without changing errno");
+
+    GuardedPage transformPage;
+    auto* roTransformPoints = transformPage.As<GuestVector>();
+    roTransformPoints[0] = {64, 0};
+    roTransformPoints[1] = {0, 128};
+    transformPage.SetReadOnly();
+    const GuestOutline roTransformOutline{0, 2, roTransformPoints, nullptr, nullptr, 0};
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtOutlineTransform_nid_no_patch(&roTransformOutline, &shear); }) &&
+                roTransformPoints[0].x == 64 && roTransformPoints[0].y == 0 && roTransformPoints[1].x == 0 && roTransformPoints[1].y == 128,
+            "transform rejects read-only points without changing errno");
+
+    errno = 71;
+    Require(sceFreeTypeOtOutlineEmboldenXY_nid_no_patch(badOutline, 128, 128) == 0x06 && errno == 71,
+            "emboldenXY rejects an unmapped outline without changing errno");
+    errno = 71;
+    Require(sceFreeTypeOtOutlineEmboldenXY_nid_no_patch(badOutline, 1, -1) == 0x06 && errno == 71,
+            "emboldenXY rejects an unmapped outline even for zero halved strengths");
+    errno = 71;
+    Require(sceFreeTypeOtOutlineEmbolden_nid_no_patch(badOutline, 128) == 0x06 && errno == 71,
+            "embolden rejects an unmapped outline without changing errno");
+
+    Shape badPointsShape({{0, 0}, {0, 640}, {640, 640}, {640, 0}}, {3});
+    badPointsShape.outline.points = badPoints;
+    errno = 71;
+    Require(sceFreeTypeOtOutlineEmbolden_nid_no_patch(&badPointsShape.outline, 128) == 0x06 && errno == 71,
+            "embolden rejects unmapped points without changing errno");
+
+    Shape badContoursShape({{0, 0}, {0, 640}, {640, 640}, {640, 0}}, {3});
+    badContoursShape.outline.contours = badContours;
+    errno = 71;
+    Require(sceFreeTypeOtOutlineEmbolden_nid_no_patch(&badContoursShape.outline, 128) == 0x06 &&
+                badContoursShape.Is({{0, 0}, {0, 640}, {640, 640}, {640, 0}}) && errno == 71,
+            "embolden rejects unmapped contours without modifying points or errno");
+
+    GuardedPage emboldenPage;
+    auto* roEmboldenPoints = emboldenPage.As<GuestVector>();
+    roEmboldenPoints[0] = {0, 0};
+    roEmboldenPoints[1] = {0, 640};
+    roEmboldenPoints[2] = {640, 640};
+    roEmboldenPoints[3] = {640, 0};
+    emboldenPage.SetReadOnly();
+    std::uint16_t roContours[]{3};
+    GuestOutline roEmboldenOutline{1, 4, roEmboldenPoints, nullptr, roContours, 0};
+    errno = 71;
+    Require(sceFreeTypeOtOutlineEmbolden_nid_no_patch(&roEmboldenOutline, 64) == 0x06 && errno == 71,
+            "embolden rejects read-only points without changing errno");
+
+    errno = 71;
+    sceFreeTypeOtOutlineTransform_nid_no_patch(&shape.outline, &shear);
+    Require(errno == 71, "transform preserves errno on success");
+    Shape ok({{0, 0}, {0, 640}, {640, 640}, {640, 0}}, {3});
+    errno = 71;
+    Require(sceFreeTypeOtOutlineEmbolden_nid_no_patch(&ok.outline, 64) == 0 && errno == 71, "embolden preserves errno on success");
+}
+
 }
 
 int main() {
     Transform();
     Embolden();
+    GuestPointers();
     std::puts("Guest FreeType Ot outline transform tests passed");
     return 0;
 }

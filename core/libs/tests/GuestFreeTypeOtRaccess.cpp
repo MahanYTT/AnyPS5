@@ -1,9 +1,11 @@
 #include "prx/libSceFreeTypeOt/include/Memory.hpp"
 #include "prx/libSceFreeTypeOt/include/Raccess.hpp"
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -173,6 +175,112 @@ void TruncatedReferences() {
     Require(session.recorder.allocs == 1 && session.recorder.frees == 1, "the reference array is freed on a read error");
 }
 
+template <typename Call>
+void RejectsUnmapped(Call&& call, const char* message) {
+    errno = 71;
+    bool threw = false;
+    try {
+        call();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw && errno == 71, message);
+}
+
+void GuestPointerFaultsAndErrno() {
+    const Fork fork = MakeFork(0, false);
+    Session session(fork.bytes);
+    auto* badLibrary = reinterpret_cast<GuestRaccessLibrary*>(std::uintptr_t{0x10});
+    auto* badStream = reinterpret_cast<GuestStreamRec*>(std::uintptr_t{0x10});
+    auto* badInt64 = reinterpret_cast<std::int64_t*>(std::uintptr_t{0x10});
+    auto* badOffsets = reinterpret_cast<std::int64_t**>(std::uintptr_t{0x10});
+    auto* badBase = reinterpret_cast<char*>(std::uintptr_t{0x10});
+    auto* badNames = reinterpret_cast<char**>(std::uintptr_t{0x10});
+    auto* badErrors = reinterpret_cast<std::int32_t*>(std::uintptr_t{0x10});
+
+    std::int64_t mapOffset = -1;
+    std::int64_t rdataPos = -1;
+    RejectsUnmapped([&] { FT_Raccess_Get_HeaderInfo_nid_postfix(&session.library, badStream, 0, &mapOffset, &rdataPos); },
+        "header info rejects an unmapped stream");
+    Require(mapOffset == -1 && rdataPos == -1, "header info writes nothing when stream is unmapped");
+    RejectsUnmapped([&] { FT_Raccess_Get_HeaderInfo_nid_postfix(&session.library, &session.stream, 0, &mapOffset, badInt64); },
+        "header info rejects an unmapped rdataPos");
+    Require(mapOffset == -1, "header info stops before mapOffset when rdataPos is unmapped");
+    RejectsUnmapped([&] { FT_Raccess_Get_HeaderInfo_nid_postfix(&session.library, &session.stream, 0, badInt64, &rdataPos); },
+        "header info rejects an unmapped mapOffset");
+    Require(rdataPos == 0x100, "header info still writes rdataPos before rejecting an unmapped mapOffset");
+
+    errno = 71;
+    Require(FT_Raccess_Get_HeaderInfo_nid_postfix(&session.library, &session.stream, 0, &mapOffset, &rdataPos) == 0 && errno == 71,
+        "header info preserves errno");
+
+    std::int64_t* offsets = nullptr;
+    std::int64_t count = -1;
+    RejectsUnmapped([&] { FT_Raccess_Get_DataOffsets_nid_postfix(badLibrary, &session.stream, mapOffset, rdataPos, Post, &offsets, &count); },
+        "data offsets rejects an unmapped library");
+    Require(count == -1 && !offsets, "data offsets writes nothing when library is unmapped");
+
+    RejectsUnmapped([&] { FT_Raccess_Get_DataOffsets_nid_postfix(&session.library, badStream, mapOffset, rdataPos, Post, &offsets, &count); },
+        "data offsets rejects an unmapped stream");
+    Require(count == -1 && !offsets, "data offsets writes nothing when stream is unmapped");
+
+    RejectsUnmapped([&] { FT_Raccess_Get_DataOffsets_nid_postfix(&session.library, &session.stream, mapOffset, rdataPos, Post, &offsets, badInt64); },
+        "data offsets rejects an unmapped count");
+    Require(!offsets && session.recorder.allocs == session.recorder.frees, "data offsets allocates nothing when count is unmapped");
+
+    GuestRaccessLibrary brokenLibrary{};
+    brokenLibrary.memory = reinterpret_cast<GuestMemoryRec*>(std::uintptr_t{0x10});
+    RejectsUnmapped([&] { FT_Raccess_Get_DataOffsets_nid_postfix(&brokenLibrary, &session.stream, mapOffset, rdataPos, Post, &offsets, &count); },
+        "data offsets rejects an unmapped library memory");
+    Require(count == 3 && !offsets, "data offsets writes count before checking library memory");
+
+    count = -1;
+    RejectsUnmapped([&] { FT_Raccess_Get_DataOffsets_nid_postfix(&session.library, &session.stream, mapOffset, rdataPos, Post, badOffsets, &count); },
+        "data offsets rejects an unmapped offsets output");
+    Require(count == 3 && session.recorder.allocs == session.recorder.frees, "data offsets frees temporary and result allocations when offsets is unmapped");
+
+    errno = 71;
+    offsets = nullptr;
+    count = -1;
+    Require(FT_Raccess_Get_DataOffsets_nid_postfix(&session.library, &session.stream, mapOffset, rdataPos, Post, &offsets, &count) == 0 && errno == 71,
+        "data offsets preserves errno");
+    ft_mem_free_nid_postfix(&session.recorder.memory, offsets);
+
+    char* guessNames[9]{};
+    std::int64_t guessOffsets[9]{};
+    std::int32_t guessErrors[9]{};
+    for (int index = 0; index < 9; ++index) {
+        guessNames[index] = reinterpret_cast<char*>(std::uintptr_t{1});
+        guessOffsets[index] = -7;
+        guessErrors[index] = -1;
+    }
+    char validBase[] = "/anyps5_missing_raccess_probe/font.ttf";
+    RejectsUnmapped([&] { FT_Raccess_Guess_nid_postfix(badLibrary, nullptr, validBase, guessNames, guessOffsets, guessErrors); },
+        "guess rejects an unmapped library");
+    RejectsUnmapped([&] { FT_Raccess_Guess_nid_postfix(&brokenLibrary, nullptr, validBase, guessNames, guessOffsets, guessErrors); },
+        "guess rejects an unmapped library memory");
+    RejectsUnmapped([&] { FT_Raccess_Guess_nid_postfix(&session.library, badStream, validBase, guessNames, guessOffsets, guessErrors); },
+        "guess rejects an unmapped stream");
+    RejectsUnmapped([&] { FT_Raccess_Guess_nid_postfix(&session.library, nullptr, badBase, guessNames, guessOffsets, guessErrors); },
+        "guess rejects an unmapped baseName");
+    RejectsUnmapped([&] { FT_Raccess_Guess_nid_postfix(&session.library, nullptr, validBase, badNames, guessOffsets, guessErrors); },
+        "guess rejects an unmapped newNames");
+    RejectsUnmapped([&] { FT_Raccess_Guess_nid_postfix(&session.library, nullptr, validBase, guessNames, badInt64, guessErrors); },
+        "guess rejects an unmapped offsets");
+    RejectsUnmapped([&] { FT_Raccess_Guess_nid_postfix(&session.library, nullptr, validBase, guessNames, guessOffsets, badErrors); },
+        "guess rejects an unmapped errors");
+    Require(guessNames[0] == reinterpret_cast<char*>(std::uintptr_t{1}) && guessOffsets[0] == -7 && guessErrors[0] == -1,
+        "guess leaves output arrays untouched when any pointer check fails");
+
+    FT_Raccess_Guess_nid_postfix(&session.library, nullptr, validBase, guessNames, guessOffsets, guessErrors);
+    Require(guessErrors[0] == 0x51 && guessErrors[1] == 0x51 && !guessNames[0] && !guessNames[1] && guessOffsets[0] == -7 && guessOffsets[1] == -7,
+        "guess handles null stream for Apple rules without overwriting offsets");
+    Require(guessErrors[3] == 0 && guessNames[3] && std::strcmp(guessNames[3], "/anyps5_missing_raccess_probe/font.ttf/..namedfork/rsrc") == 0 && guessOffsets[3] == 0,
+        "guess produces appended rsrc path");
+    for (char* name : guessNames) ft_mem_free_nid_postfix(&session.recorder.memory, name);
+    Require(session.recorder.allocs == session.recorder.frees, "guess frees all allocated names");
+}
+
 }
 
 int main() {
@@ -180,6 +288,7 @@ int main() {
     HeaderAndOffsets(0x80, true);
     RejectedHeaders();
     TruncatedReferences();
+    GuestPointerFaultsAndErrno();
     std::puts("Guest FreeType Ot raccess tests passed");
     return 0;
 }

@@ -1,9 +1,16 @@
 #include "prx/libSceFreeTypeOt/include/SizeMetrics.hpp"
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -124,12 +131,155 @@ void MatchSize() {
     Require(FT_Match_Size_nid_postfix(&outlineOnly.face, nullptr, 0, &index) == 0x23, "a face without strikes is an invalid face handle");
 }
 
+struct GuardedPage {
+    void* base = nullptr;
+    std::size_t size = 0;
+
+    GuardedPage() {
+#ifdef _WIN32
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        size = info.dwPageSize;
+        base = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+        base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) base = nullptr;
+#endif
+        Require(base != nullptr, "allocate guarded page");
+    }
+
+    ~GuardedPage() {
+        if (!base) return;
+#ifdef _WIN32
+        VirtualFree(base, 0, MEM_RELEASE);
+#else
+        munmap(base, size);
+#endif
+    }
+
+    template <typename T> T* As() const { return static_cast<T*>(base); }
+
+    void SetReadOnly() const {
+#ifdef _WIN32
+        DWORD prev = 0;
+        Require(VirtualProtect(base, size, PAGE_READONLY, &prev) != 0, "protect guarded page");
+#else
+        Require(mprotect(base, size, PROT_READ) == 0, "protect guarded page");
+#endif
+    }
+};
+
+template <typename TCall>
+bool RejectsPreservingErrno(TCall call) {
+    errno = 71;
+    try {
+        call();
+    } catch (const std::runtime_error&) {
+        return errno == 71;
+    }
+    return false;
+}
+
+void GuestPointers() {
+    auto* const badFace = reinterpret_cast<GuestFaceRec*>(std::uintptr_t{0x10});
+    auto* const badSize = reinterpret_cast<GuestSizeRec*>(std::uintptr_t{0x10});
+    auto* const badStrikes = reinterpret_cast<GuestBitmapSize*>(std::uintptr_t{0x10});
+    const auto* const badReq = reinterpret_cast<const GuestSizeRequestRec*>(std::uintptr_t{0x10});
+    auto* const badIndex = reinterpret_cast<std::uint64_t*>(std::uintptr_t{0x10});
+
+    Require(RejectsPreservingErrno([&] { FT_Select_Metrics_nid_postfix(badFace, 0); }),
+            "FT_Select_Metrics rejects unmapped face");
+    Require(RejectsPreservingErrno([&] { FT_Request_Metrics_nid_postfix(badFace, nullptr); }),
+            "FT_Request_Metrics rejects unmapped face");
+    Require(RejectsPreservingErrno([&] { FT_Match_Size_nid_postfix(badFace, nullptr, 0, nullptr); }),
+            "FT_Match_Size rejects unmapped face");
+
+    {
+        Fixture fixture(3);
+        fixture.face.size = badSize;
+        const GuestSizeRequestRec req{0, 16 * 64, 16 * 64, 0, 0};
+        Require(RejectsPreservingErrno([&] { FT_Select_Metrics_nid_postfix(&fixture.face, 0); }),
+                "FT_Select_Metrics rejects unmapped size");
+        Require(RejectsPreservingErrno([&] { FT_Request_Metrics_nid_postfix(&fixture.face, &req); }),
+                "FT_Request_Metrics rejects unmapped size");
+        Require(RejectsPreservingErrno([&] { FT_Match_Size_nid_postfix(&fixture.face, &req, 0, nullptr); }),
+                "FT_Match_Size rejects unmapped size");
+    }
+
+    {
+        Fixture fixture(3);
+        fixture.face.available_sizes = badStrikes;
+        const GuestSizeRequestRec req{0, 16 * 64, 16 * 64, 0, 0};
+        Require(RejectsPreservingErrno([&] { FT_Select_Metrics_nid_postfix(&fixture.face, 0); }),
+                "FT_Select_Metrics rejects unmapped available_sizes");
+        Require(RejectsPreservingErrno([&] { FT_Request_Metrics_nid_postfix(&fixture.face, &req); }),
+                "FT_Request_Metrics rejects unmapped available_sizes");
+        Require(RejectsPreservingErrno([&] { FT_Match_Size_nid_postfix(&fixture.face, &req, 0, nullptr); }),
+                "FT_Match_Size rejects unmapped available_sizes");
+    }
+
+    {
+        Fixture scalable(1);
+        Require(RejectsPreservingErrno([&] { FT_Request_Metrics_nid_postfix(&scalable.face, badReq); }),
+                "FT_Request_Metrics rejects unmapped request");
+        Fixture fixed(3);
+        Require(RejectsPreservingErrno([&] { FT_Match_Size_nid_postfix(&fixed.face, badReq, 0, nullptr); }),
+                "FT_Match_Size rejects unmapped request");
+    }
+
+    {
+        Fixture fixed(3);
+        const GuestSizeRequestRec req{0, 16 * 64, 16 * 64, 0, 0};
+        Require(RejectsPreservingErrno([&] { FT_Match_Size_nid_postfix(&fixed.face, &req, 0, badIndex); }),
+                "FT_Match_Size rejects unmapped size_index");
+    }
+
+    {
+        GuardedPage sizePage;
+        Fixture fixture(3);
+        *sizePage.As<GuestSizeRec>() = fixture.size;
+        fixture.face.size = sizePage.As<GuestSizeRec>();
+        sizePage.SetReadOnly();
+        const GuestSizeRequestRec req{0, 16 * 64, 16 * 64, 0, 0};
+        Require(RejectsPreservingErrno([&] { FT_Select_Metrics_nid_postfix(&fixture.face, 1); }),
+                "FT_Select_Metrics rejects read-only size");
+        Require(RejectsPreservingErrno([&] { FT_Request_Metrics_nid_postfix(&fixture.face, &req); }),
+                "FT_Request_Metrics rejects read-only size");
+    }
+
+    {
+        GuardedPage indexPage;
+        *indexPage.As<std::uint64_t>() = 99;
+        indexPage.SetReadOnly();
+        Fixture fixed(3);
+        const GuestSizeRequestRec req{0, 16 * 64, 16 * 64, 0, 0};
+        Require(RejectsPreservingErrno([&] { FT_Match_Size_nid_postfix(&fixed.face, &req, 0, indexPage.As<std::uint64_t>()); }) &&
+                *indexPage.As<std::uint64_t>() == 99,
+                "FT_Match_Size rejects read-only size_index");
+    }
+
+    {
+        Fixture fixture(3);
+        const GuestSizeRequestRec req{0, 16 * 64, 16 * 64, 0, 0};
+        std::uint64_t index = 99;
+        errno = 71;
+        FT_Select_Metrics_nid_postfix(&fixture.face, 1);
+        Require(errno == 71, "FT_Select_Metrics preserves errno on success");
+        Require(FT_Request_Metrics_nid_postfix(&fixture.face, &req) == 0 && errno == 71,
+                "FT_Request_Metrics preserves errno on success");
+        Require(FT_Match_Size_nid_postfix(&fixture.face, &req, 0, &index) == 0 && index == 1 && errno == 71,
+                "FT_Match_Size preserves errno on success");
+    }
+}
+
 }
 
 int main() {
     RequestMetrics();
     SelectMetrics();
     MatchSize();
+    GuestPointers();
     std::puts("Guest FreeType Ot size metrics tests passed");
     return 0;
 }

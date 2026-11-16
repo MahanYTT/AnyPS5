@@ -1,9 +1,16 @@
 #include "prx/libSceFreeTypeOt/include/Polar.hpp"
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -87,12 +94,125 @@ void Rotate() {
     Require(Throws([] { sceFreeTypeOtVectorFromPolar_nid_no_patch(nullptr, Degree, 0); }), "FT_Vector_From_Polar throws for a null vector");
 }
 
+struct GuardedPage {
+    void* base = nullptr;
+    std::size_t size = 0;
+
+    GuardedPage() {
+#ifdef _WIN32
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        size = info.dwPageSize;
+        base = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+        base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) base = nullptr;
+#endif
+        Require(base != nullptr, "guarded page allocates");
+    }
+
+    ~GuardedPage() {
+        if (!base) return;
+#ifdef _WIN32
+        VirtualFree(base, 0, MEM_RELEASE);
+#else
+        munmap(base, size);
+#endif
+    }
+
+    template <typename T>
+    T* As() const {
+        return static_cast<T*>(base);
+    }
+
+    void SetReadOnly() const {
+#ifdef _WIN32
+        DWORD previous = 0;
+        Require(VirtualProtect(base, size, PAGE_READONLY, &previous) != 0, "guarded page becomes read-only");
+#else
+        Require(mprotect(base, size, PROT_READ) == 0, "guarded page becomes read-only");
+#endif
+    }
+};
+
+template <typename TCall>
+bool ThrowsPreservingErrno(TCall call) {
+    errno = 71;
+    try {
+        call();
+    } catch (const std::runtime_error&) {
+        return errno == 71;
+    }
+    return false;
+}
+
+void GuestPointers() {
+    auto* badVector = reinterpret_cast<GuestVector*>(std::uintptr_t{0x10});
+    auto* badValue = reinterpret_cast<std::int64_t*>(std::uintptr_t{0x10});
+    GuestVector vector{3 * Degree, 4 * Degree};
+    std::int64_t length = 11;
+    std::int64_t angle = 22;
+
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtVectorLength_nid_no_patch(badVector); }),
+            "length rejects an unmapped vector without changing errno");
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtVectorPolarize_nid_no_patch(badVector, &length, &angle); }) &&
+                length == 11 && angle == 22,
+            "polarize rejects an unmapped vector without modifying outputs or errno");
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtVectorPolarize_nid_no_patch(&vector, badValue, &angle); }) &&
+                angle == 22,
+            "polarize rejects an unmapped length without modifying angle or errno");
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtVectorPolarize_nid_no_patch(&vector, &length, badValue); }) &&
+                length == 11,
+            "polarize rejects an unmapped angle before writing length or modifying errno");
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtVectorFromPolar_nid_no_patch(badVector, Degree, 0); }),
+            "fromPolar rejects an unmapped vector without changing errno");
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtVectorRotate_nid_no_patch(badVector, Degree); }),
+            "rotate rejects an unmapped vector without changing errno");
+
+    GuardedPage vectorPage;
+    *vectorPage.As<GuestVector>() = {3 * Degree, 4 * Degree};
+    vectorPage.SetReadOnly();
+    auto* roVector = vectorPage.As<GuestVector>();
+    errno = 71;
+    Require(sceFreeTypeOtVectorLength_nid_no_patch(roVector) == 5 * Degree && errno == 71,
+            "length reads a read-only vector and preserves errno");
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtVectorFromPolar_nid_no_patch(roVector, Degree, 30 * Degree); }) &&
+                roVector->x == 3 * Degree && roVector->y == 4 * Degree,
+            "fromPolar rejects a read-only vector without changing errno");
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtVectorRotate_nid_no_patch(roVector, 30 * Degree); }) &&
+                roVector->x == 3 * Degree && roVector->y == 4 * Degree,
+            "rotate rejects a read-only vector without changing errno");
+
+    GuardedPage scalarPage;
+    *scalarPage.As<std::int64_t>() = 77;
+    scalarPage.SetReadOnly();
+    auto* roScalar = scalarPage.As<std::int64_t>();
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtVectorPolarize_nid_no_patch(&vector, roScalar, &angle); }) &&
+                *roScalar == 77 && angle == 22,
+            "polarize rejects a read-only length without modifying outputs or errno");
+    Require(ThrowsPreservingErrno([&] { sceFreeTypeOtVectorPolarize_nid_no_patch(&vector, &length, roScalar); }) &&
+                length == 11 && *roScalar == 77,
+            "polarize rejects a read-only angle before writing length or modifying errno");
+
+    errno = 71;
+    sceFreeTypeOtVectorPolarize_nid_no_patch(&vector, &length, &angle);
+    Require(length == 5 * Degree && angle == 3481920 && errno == 71, "polarize preserves errno on success");
+    errno = 71;
+    sceFreeTypeOtVectorRotate_nid_no_patch(&vector, 90 * Degree);
+    Require(vector.x == -4 * Degree && vector.y == 3 * Degree && errno == 71, "rotate preserves errno on success");
+    errno = 71;
+    sceFreeTypeOtVectorFromPolar_nid_no_patch(&vector, Degree, 0);
+    Require(vector.x == Degree && vector.y == 0 && errno == 71, "fromPolar preserves errno on success");
+}
+
 }
 
 int main() {
     Lengths();
     Polarize();
     Rotate();
+    GuestPointers();
     std::puts("Guest FreeType Ot polar tests passed");
     return 0;
 }

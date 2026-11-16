@@ -9,6 +9,8 @@
 #include "prx/libSceFreeTypeOt/include/Memory.hpp"
 #include "prx/libc/include/General.hpp"
 
+#include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -20,9 +22,36 @@ namespace {
 constexpr std::int64_t IntMax = std::numeric_limits<std::int32_t>::max();
 constexpr std::int64_t IntMin = std::numeric_limits<std::int32_t>::min();
 
+bool CopyInPreservingErrno(void* destination, const void* source, std::size_t bytes) {
+    const int savedErrno = errno;
+    const bool ok = GuestCopyIn_nid_no_patch(destination, source, bytes);
+    errno = savedErrno;
+    return ok;
+}
+
+bool CopyOutPreservingErrno(void* destination, const void* source, std::size_t bytes) {
+    const int savedErrno = errno;
+    const bool ok = GuestCopyOut_nid_no_patch(destination, source, bytes);
+    errno = savedErrno;
+    return ok;
+}
+
+bool WritablePreservingErrno(void* destination, std::size_t bytes) {
+    const int savedErrno = errno;
+    const bool ok = GuestWritable_nid_no_patch(destination, bytes);
+    errno = savedErrno;
+    return ok;
+}
+
+GuestBitmap* SlotBitmapField(GuestGlyphSlotRec* slot) {
+    return &slot->bitmap;
+}
+
 std::int32_t CopyBitmap(GuestBitmapLibrary* library, const GuestBitmap* source, GuestBitmap* target, const char* function) {
     if (!library) NotImplemented_nid_no_patch(function);
-    GuestMemoryRec* memory = library->memory;
+    GuestBitmapLibrary guestLibrary{};
+    if (!CopyInPreservingErrno(&guestLibrary, library, sizeof(guestLibrary))) NotImplemented_nid_no_patch(function);
+    GuestMemoryRec* memory = guestLibrary.memory;
     if (!source->buffer) {
         *target = *source;
         return 0;
@@ -38,7 +67,10 @@ std::int32_t CopyBitmap(GuestBitmapLibrary* library, const GuestBitmap* source, 
     if (!error) {
         *target = *source;
         target->buffer = buffer;
-        if (size > 0) std::memcpy(buffer, source->buffer, static_cast<std::size_t>(size));
+        if (size > 0 && !CopyInPreservingErrno(buffer, source->buffer, static_cast<std::size_t>(size))) {
+            ft_mem_free_nid_postfix(memory, buffer);
+            NotImplemented_nid_no_patch(function);
+        }
     }
     return error;
 }
@@ -49,15 +81,34 @@ extern "C" {
 
 int APS5_VABI sceFreeTypeOtGlyphSlotOwnBitmap_nid_no_patch(GuestGlyphSlotRec* slot) {
     const char* function = __func__;
-    if (!slot || slot->format != GlyphFormatBitmap) return 0;
-    auto* internal = static_cast<GuestSlotInternalRec*>(slot->internal);
+    if (!slot) return 0;
+    GuestGlyphSlotRec guestSlot{};
+    if (!CopyInPreservingErrno(&guestSlot, slot, sizeof(guestSlot))) NotImplemented_nid_no_patch(function);
+    if (guestSlot.format != GlyphFormatBitmap) return 0;
+    auto* internal = static_cast<GuestSlotInternalRec*>(guestSlot.internal);
     if (!internal) NotImplemented_nid_no_patch(function);
-    if (internal->flags & GlyphOwnBitmap) return 0;
+    GuestSlotInternalRec guestInternal{};
+    if (!CopyInPreservingErrno(&guestInternal, internal, sizeof(guestInternal))) NotImplemented_nid_no_patch(function);
+    if (guestInternal.flags & GlyphOwnBitmap) return 0;
+    GuestBitmap* slotBitmap = SlotBitmapField(slot);
+    if (!WritablePreservingErrno(slotBitmap, sizeof(*slotBitmap)) ||
+        !WritablePreservingErrno(&internal->flags, sizeof(internal->flags))) {
+        NotImplemented_nid_no_patch(function);
+    }
     GuestBitmap bitmap{};
-    const std::int32_t error = CopyBitmap(static_cast<GuestBitmapLibrary*>(slot->library), &slot->bitmap, &bitmap, function);
+    const std::int32_t error = CopyBitmap(static_cast<GuestBitmapLibrary*>(guestSlot.library), &guestSlot.bitmap, &bitmap, function);
     if (error) return error;
-    slot->bitmap = bitmap;
-    internal->flags |= GlyphOwnBitmap;
+    if (!CopyOutPreservingErrno(slotBitmap, &bitmap, sizeof(bitmap))) {
+        GuestBitmapLibrary guestLibrary{};
+        if (CopyInPreservingErrno(&guestLibrary, guestSlot.library, sizeof(guestLibrary))) {
+            ft_mem_free_nid_postfix(guestLibrary.memory, bitmap.buffer);
+        }
+        NotImplemented_nid_no_patch(function);
+    }
+    guestInternal.flags |= GlyphOwnBitmap;
+    if (!CopyOutPreservingErrno(&internal->flags, &guestInternal.flags, sizeof(guestInternal.flags))) {
+        NotImplemented_nid_no_patch(function);
+    }
     return 0;
 }
 APS5_EXPORT("nSIux4OQyJM", sceFreeTypeOtGlyphSlotOwnBitmap_nid_no_patch);

@@ -1,6 +1,7 @@
 #include "prx/libSceFreeTypeOt/include/Memory.hpp"
 #include "prx/libSceFreeTypeOt/include/System.hpp"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -9,8 +10,15 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -308,6 +316,145 @@ void GuessForks() {
     FT_Stream_Close_nid_postfix(&stream);
 }
 
+template <typename T>
+T* BadPointer(std::uintptr_t value = 0x10) {
+    return reinterpret_cast<T*>(value);
+}
+
+template <class Call>
+bool Rejects(Call call) {
+    errno = 71;
+    try {
+        call();
+    } catch (const std::runtime_error&) {
+        return errno == 71;
+    }
+    return false;
+}
+
+struct GuardedPage {
+    void* base = nullptr;
+    std::size_t size = 0;
+
+    GuardedPage() {
+#ifdef _WIN32
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        size = info.dwPageSize;
+        base = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+        base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) base = nullptr;
+#endif
+        Require(base != nullptr, "allocate guarded page");
+    }
+
+    ~GuardedPage() {
+        if (!base) return;
+#ifdef _WIN32
+        VirtualFree(base, 0, MEM_RELEASE);
+#else
+        munmap(base, size);
+#endif
+    }
+
+    template <typename T>
+    T* As() const {
+        return static_cast<T*>(base);
+    }
+
+    void SetReadOnly() const {
+#ifdef _WIN32
+        DWORD prev = 0;
+        Require(VirtualProtect(base, size, PAGE_READONLY, &prev) != 0, "protect page read-only");
+#else
+        Require(mprotect(base, size, PROT_READ) == 0, "protect page read-only");
+#endif
+    }
+};
+
+void UnmappedPointers() {
+    Library owner;
+    auto* badStream = BadPointer<GuestStreamRec>();
+    auto* badPath = BadPointer<char>();
+    auto* badBuffer = BadPointer<std::uint8_t>();
+    auto* badLibrary = BadPointer<GuestRaccessLibrary>();
+    auto* badArgs = BadPointer<GuestStreamOpenArgs>();
+    auto* badAstream = BadPointer<GuestStreamRec*>();
+
+    GuardedPage readOnlyStreamPage;
+    *readOnlyStreamPage.As<GuestStreamRec>() = GuestStreamRec{};
+    readOnlyStreamPage.SetReadOnly();
+    auto* roStream = readOnlyStreamPage.As<GuestStreamRec>();
+
+    GuardedPage readOnlyOutPage;
+    readOnlyOutPage.SetReadOnly();
+    auto* roAstream = readOnlyOutPage.As<GuestStreamRec*>();
+    auto* roBuffer = readOnlyOutPage.As<std::uint8_t>();
+
+    Require(Rejects([&] { FT_Stream_Open_nid_postfix(badStream, "/app0/data.bin"); }), "open rejects unmapped stream");
+    Require(Rejects([&] { FT_Stream_Open_nid_postfix(roStream, "/app0/data.bin"); }), "open rejects read-only stream");
+
+    GuestStreamRec stream{};
+    Require(Rejects([&] { FT_Stream_Open_nid_postfix(&stream, badPath); }), "open rejects unmapped path");
+
+    errno = 71;
+    Require(FT_Stream_Open_nid_postfix(&stream, "/app0/data.bin") == 0 && errno == 71, "open preserves errno");
+    const auto io = stream.read;
+    const auto close = stream.close;
+    Require(io != nullptr && close != nullptr, "open installs callbacks");
+
+    Require(Rejects([&] { io(badStream, 0, nullptr, 0); }), "StreamIo rejects unmapped stream");
+    Require(Rejects([&] { io(&stream, 0, badBuffer, 4); }), "StreamIo rejects unmapped buffer");
+    Require(Rejects([&] { io(&stream, 0, roBuffer, 4); }), "StreamIo rejects read-only buffer");
+    Require(Rejects([&] { io(&stream, 300, badBuffer, 4); }), "StreamIo at EOF rejects unmapped buffer");
+    std::uint8_t readBuf[8]{};
+    errno = 71;
+    Require(io(&stream, 0, readBuf, sizeof(readBuf)) == sizeof(readBuf) && errno == 71, "StreamIo preserves errno");
+    Require(Rejects([&] { close(badStream); }), "StreamClose rejects unmapped stream");
+    Require(Rejects([&] { close(roStream); }), "StreamClose rejects read-only stream");
+    errno = 71;
+    close(&stream);
+    Require(errno == 71, "StreamClose preserves errno");
+
+    GuestStreamOpenArgs args{};
+    args.flags = 0x1;
+    GuestStreamRec* out = reinterpret_cast<GuestStreamRec*>(0x1234);
+    Require(Rejects([&] { FT_Stream_New_nid_postfix(&owner.library, &args, badAstream); }), "new rejects unmapped astream");
+    Require(Rejects([&] { FT_Stream_New_nid_postfix(&owner.library, &args, roAstream); }), "new rejects read-only astream");
+    Require(Rejects([&] { FT_Stream_New_nid_postfix(badLibrary, &args, &out); }) && !out, "new rejects unmapped library");
+    Require(Rejects([&] { FT_Stream_New_nid_postfix(&owner.library, badArgs, &out); }) && !out && owner.recorder.allocs == owner.recorder.frees,
+            "new rejects unmapped args without leaking");
+
+    args.flags = 0x4;
+    args.pathname = badPath;
+    out = reinterpret_cast<GuestStreamRec*>(0x1234);
+    Require(Rejects([&] { FT_Stream_New_nid_postfix(&owner.library, &args, &out); }) && !out && owner.recorder.allocs == owner.recorder.frees,
+            "new rejects unmapped pathname without leaking");
+
+    args.flags = 0x2;
+    args.stream = badStream;
+    out = reinterpret_cast<GuestStreamRec*>(0x1234);
+    Require(Rejects([&] { FT_Stream_New_nid_postfix(&owner.library, &args, &out); }) && !out && owner.recorder.allocs == owner.recorder.frees,
+            "new rejects unmapped args->stream without leaking");
+
+    args.stream = roStream;
+    out = reinterpret_cast<GuestStreamRec*>(0x1234);
+    Require(Rejects([&] { FT_Stream_New_nid_postfix(&owner.library, &args, &out); }) && !out && owner.recorder.allocs == owner.recorder.frees,
+            "new rejects read-only args->stream without leaking");
+
+    GuestRaccessLibrary brokenLibrary{BadPointer<GuestMemoryRec>()};
+    args.flags = 0x1;
+    out = reinterpret_cast<GuestStreamRec*>(0x1234);
+    Require(Rejects([&] { FT_Stream_New_nid_postfix(&brokenLibrary, &args, &out); }) && !out, "new rejects unmapped library memory");
+
+    errno = 71;
+    Require(FT_Stream_New_nid_postfix(&owner.library, &args, &out) == 0 && out != nullptr && errno == 71, "valid new preserves errno");
+    FT_Stream_Free_nid_postfix(out, 0);
+    Require(owner.recorder.allocs == owner.recorder.frees, "freed valid new stream");
+}
+
 }
 
 int main() {
@@ -318,6 +465,7 @@ int main() {
     OpenFile();
     NewStream();
     GuessForks();
+    UnmappedPointers();
     std::filesystem::current_path(previous);
     std::filesystem::remove_all(root);
     std::puts("Guest FreeType Ot system tests passed");

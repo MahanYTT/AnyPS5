@@ -1,8 +1,16 @@
 #include "prx/libSceFreeTypeOt/include/Memory.hpp"
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -244,6 +252,160 @@ void BoundedCopy() {
     Require(ft_mem_strcpyn_nid_postfix(buffer, "", 5) == 0 && buffer[0] == 0 && buffer[1] == 'x', "strcpyn of an empty string returns 0");
 }
 
+template <typename T>
+T* BadPointer(std::uintptr_t value = 0x10) {
+    return reinterpret_cast<T*>(value);
+}
+
+template <class Call>
+bool Rejects(Call call) {
+    errno = 71;
+    try {
+        call();
+    } catch (const std::runtime_error&) {
+        return errno == 71;
+    }
+    return false;
+}
+
+struct GuardedPage {
+    void* base = nullptr;
+    std::size_t size = 0;
+
+    GuardedPage() {
+#ifdef _WIN32
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        size = info.dwPageSize;
+        base = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+        base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) base = nullptr;
+#endif
+        Require(base != nullptr, "allocate guarded page");
+    }
+
+    ~GuardedPage() {
+        if (!base) return;
+#ifdef _WIN32
+        VirtualFree(base, 0, MEM_RELEASE);
+#else
+        munmap(base, size);
+#endif
+    }
+
+    template <typename T>
+    T* As() const {
+        return static_cast<T*>(base);
+    }
+
+    void SetReadOnly() const {
+#ifdef _WIN32
+        DWORD prev = 0;
+        Require(VirtualProtect(base, size, PAGE_READONLY, &prev) != 0, "protect page read-only");
+#else
+        Require(mprotect(base, size, PROT_READ) == 0, "protect page read-only");
+#endif
+    }
+
+    void SetInaccessible() const {
+#ifdef _WIN32
+        DWORD prev = 0;
+        Require(VirtualProtect(base, size, PAGE_NOACCESS, &prev) != 0, "protect page inaccessible");
+#else
+        Require(mprotect(base, size, PROT_NONE) == 0, "protect page inaccessible");
+#endif
+    }
+};
+
+void* APS5_VABI BadBlockAlloc(GuestMemoryRec*, std::int64_t) {
+    return BadPointer<void>();
+}
+
+void UnmappedPointers() {
+    Recorder recorder;
+    Reset(recorder);
+    std::int32_t error = -1;
+    auto* badMemory = BadPointer<GuestMemoryRec>();
+    auto* badError = BadPointer<std::int32_t>();
+    auto* badBlock = BadPointer<void>();
+    auto* badString = BadPointer<char>();
+
+    GuardedPage readOnlyPage;
+    readOnlyPage.SetReadOnly();
+    auto* roError = readOnlyPage.As<std::int32_t>();
+    auto* roDest = readOnlyPage.As<char>();
+
+    GuardedPage noAccessPage;
+    noAccessPage.SetInaccessible();
+    auto* noAccessText = noAccessPage.As<const char>();
+
+    Require(Rejects([&] { ft_mem_qalloc_nid_postfix(badMemory, 16, &error); }), "qalloc rejects unmapped memory");
+    Require(Rejects([&] { ft_mem_qalloc_nid_postfix(nullptr, 16, &error); }), "qalloc rejects null memory");
+    Require(Rejects([&] { ft_mem_qalloc_nid_postfix(&recorder.memory, 16, badError); }) && recorder.allocs == 0, "qalloc rejects unmapped error before allocating");
+    Require(Rejects([&] { ft_mem_qalloc_nid_postfix(&recorder.memory, 0, badError); }), "qalloc of size 0 rejects unmapped error");
+    Require(Rejects([&] { ft_mem_qalloc_nid_postfix(&recorder.memory, -1, roError); }), "qalloc rejects read-only error");
+    Require(Rejects([&] { ft_mem_qalloc_nid_postfix(&recorder.memory, 16, nullptr); }) && recorder.allocs == 0, "qalloc rejects null error");
+
+    Require(Rejects([&] { ft_mem_alloc_nid_postfix(badMemory, 16, &error); }), "alloc rejects unmapped memory");
+    Require(Rejects([&] { ft_mem_alloc_nid_postfix(&recorder.memory, 16, badError); }) && recorder.allocs == 0, "alloc rejects unmapped error before allocating");
+    Require(Rejects([&] { ft_mem_alloc_nid_postfix(&recorder.memory, 16, roError); }) && recorder.allocs == 0, "alloc rejects read-only error");
+
+    GuestMemoryRec badAllocMemory{nullptr, BadBlockAlloc, RecordFree, RecordRealloc};
+    Require(Rejects([&] { ft_mem_alloc_nid_postfix(&badAllocMemory, 16, &error); }), "alloc rejects unwritable returned block");
+
+    Require(Rejects([&] { ft_mem_free_nid_postfix(badMemory, badBlock); }), "free rejects unmapped memory for non-null block");
+    Require(Rejects([&] { ft_mem_free_nid_postfix(nullptr, badBlock); }), "free rejects null memory for non-null block");
+    errno = 71;
+    ft_mem_free_nid_postfix(badMemory, nullptr);
+    Require(errno == 71, "free of null ignores unmapped memory and preserves errno");
+
+    void* live = ft_mem_alloc_nid_postfix(&recorder.memory, 8, &error);
+    Require(live != nullptr && error == 0, "live block allocated");
+    Require(Rejects([&] { ft_mem_qrealloc_nid_postfix(badMemory, 4, 2, 4, live, &error); }), "qrealloc rejects unmapped memory");
+    Require(Rejects([&] { ft_mem_qrealloc_nid_postfix(badMemory, 4, 2, 0, live, &error); }), "qrealloc to zero rejects unmapped memory");
+    Require(Rejects([&] { ft_mem_qrealloc_nid_postfix(&recorder.memory, 4, 2, 4, live, badError); }), "qrealloc rejects unmapped error");
+    Require(Rejects([&] { ft_mem_qrealloc_nid_postfix(&recorder.memory, 4, 2, 4, live, roError); }), "qrealloc rejects read-only error");
+    Require(Rejects([&] { ft_mem_realloc_nid_postfix(badMemory, 4, 2, 4, live, &error); }), "realloc rejects unmapped memory");
+    Require(Rejects([&] { ft_mem_realloc_nid_postfix(&recorder.memory, 4, 2, 4, live, badError); }), "realloc rejects unmapped error");
+    ft_mem_free_nid_postfix(&recorder.memory, live);
+
+    Reset(recorder);
+    const char sample[] = "hello";
+    Require(Rejects([&] { ft_mem_dup_nid_postfix(badMemory, sample, sizeof(sample), &error); }), "dup rejects unmapped memory");
+    Require(Rejects([&] { ft_mem_dup_nid_postfix(&recorder.memory, sample, sizeof(sample), badError); }) && recorder.allocs == 0, "dup rejects unmapped error before allocating");
+    Require(Rejects([&] { ft_mem_dup_nid_postfix(&recorder.memory, badString, 8, &error); }) && recorder.allocs == recorder.frees, "dup rejects unmapped source and frees temporary block");
+    Require(Rejects([&] { ft_mem_dup_nid_postfix(&recorder.memory, noAccessText, 8, &error); }) && recorder.allocs == recorder.frees, "dup rejects inaccessible source");
+
+    Reset(recorder);
+    Require(Rejects([&] { ft_mem_strdup_nid_postfix(badMemory, "abc", &error); }), "strdup rejects unmapped memory");
+    Require(Rejects([&] { ft_mem_strdup_nid_postfix(&recorder.memory, "abc", badError); }) && recorder.allocs == 0, "strdup rejects unmapped error");
+    Require(Rejects([&] { ft_mem_strdup_nid_postfix(&recorder.memory, badString, &error); }) && recorder.allocs == 0, "strdup rejects unmapped string without allocating");
+    Require(Rejects([&] { ft_mem_strdup_nid_postfix(&recorder.memory, noAccessText, &error); }) && recorder.allocs == 0, "strdup rejects inaccessible string");
+
+    char destination[8] = {'z', 'z', 'z', 'z', 'z', 'z', 'z', 'z'};
+    Require(Rejects([&] { ft_mem_strcpyn_nid_postfix(badString, "abc", 4); }), "strcpyn rejects unmapped destination");
+    Require(Rejects([&] { ft_mem_strcpyn_nid_postfix(roDest, "abc", 4); }), "strcpyn rejects read-only destination");
+    Require(Rejects([&] { ft_mem_strcpyn_nid_postfix(nullptr, "abc", 4); }), "strcpyn rejects null destination");
+    Require(Rejects([&] { ft_mem_strcpyn_nid_postfix(destination, badString, 4); }) && destination[0] == 'z', "strcpyn rejects unmapped source without modifying destination");
+    Require(Rejects([&] { ft_mem_strcpyn_nid_postfix(destination, badString, 0); }) && destination[0] == 'z', "strcpyn size 0 rejects unmapped source");
+    Require(Rejects([&] { ft_mem_strcpyn_nid_postfix(destination, noAccessText, 4); }) && destination[0] == 'z', "strcpyn rejects inaccessible source");
+    Require(Rejects([&] { ft_mem_strcpyn_nid_postfix(destination, nullptr, 4); }) && destination[0] == 'z', "strcpyn rejects null source");
+
+    errno = 71;
+    void* okBlock = ft_mem_alloc_nid_postfix(&recorder.memory, 12, &error);
+    Require(errno == 71 && okBlock != nullptr && error == 0, "valid alloc preserves errno");
+    void* okDup = ft_mem_dup_nid_postfix(&recorder.memory, "ok", 3, &error);
+    Require(errno == 71 && okDup != nullptr && error == 0, "valid dup preserves errno");
+    void* okStr = ft_mem_strdup_nid_postfix(&recorder.memory, "hi", &error);
+    Require(errno == 71 && okStr != nullptr && error == 0, "valid strdup preserves errno");
+    Require(ft_mem_strcpyn_nid_postfix(destination, "ok", sizeof(destination)) == 0 && errno == 71, "valid strcpyn preserves errno");
+    ft_mem_free_nid_postfix(&recorder.memory, okBlock);
+    ft_mem_free_nid_postfix(&recorder.memory, okDup);
+    ft_mem_free_nid_postfix(&recorder.memory, okStr);
+}
+
 }
 
 int main() {
@@ -253,6 +415,7 @@ int main() {
     ClearedReallocation();
     Duplication();
     BoundedCopy();
+    UnmappedPointers();
     std::puts("Guest FreeType Ot memory tests passed");
     return 0;
 }

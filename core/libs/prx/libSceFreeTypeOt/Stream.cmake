@@ -22,4 +22,18 @@ if(BUILD_TESTING)
         set_tests_properties(guest_freetype_stream_patched PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:${PATCHED_DIR}")
     endif()
+
+    add_test_executable(guest_freetype_ot_stream_tests ${LIBS_INCLUDE_DIR}/tests/GuestFreeTypeOtStream.cpp)
+    target_include_directories(guest_freetype_ot_stream_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_freetype_ot_stream_tests PRIVATE libSceFreeTypeOt)
+    if(WIN32)
+        target_link_libraries(guest_freetype_ot_stream_tests PRIVATE libc)
+    endif()
+    configure_windows_unwind(guest_freetype_ot_stream_tests)
+    add_test(NAME guest_freetype_ot_stream COMMAND guest_freetype_ot_stream_tests)
+    set_tests_properties(guest_freetype_ot_stream PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_freetype_ot_stream PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceFreeTypeOt>")
+    endif()
 endif()

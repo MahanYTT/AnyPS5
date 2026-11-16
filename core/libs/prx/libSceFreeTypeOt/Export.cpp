@@ -1,14 +1,16 @@
 #include "prx/libSceFreeTypeOt/libSceFreeTypeOt.hpp"
 #include "prx/libSceFreeType/include/GuestObjects.hpp"
+#include <array>
 #include <cerrno>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <string>
 #include "SceTypes.hpp"
 #include "prx/libSceFreeTypeOt/include/Calc.hpp"
 #include "prx/libc/include/General.hpp"
-#include "prx/libSceFreeTypeOt/libSceFreeTypeOt.hpp"
 
 namespace {
 
@@ -54,6 +56,40 @@ std::int32_t IntegerSqrt(std::uint64_t value) {
         }
     }
     return static_cast<std::int32_t>(low);
+}
+
+bool CopyInPreservingErrno(void* destination, const void* source, std::size_t bytes) {
+    const int savedErrno = errno;
+    const bool ok = GuestCopyIn_nid_no_patch(destination, source, bytes);
+    errno = savedErrno;
+    return ok;
+}
+
+bool CopyOutPreservingErrno(void* destination, const void* source, std::size_t bytes) {
+    const int savedErrno = errno;
+    const bool ok = GuestCopyOut_nid_no_patch(destination, source, bytes);
+    errno = savedErrno;
+    return ok;
+}
+
+bool CopyGuestCStringPreservingErrno(const char* source, std::size_t maximum, std::string& destination) {
+    const int savedErrno = errno;
+    const int status = CopyGuestString_nid_no_patch(source, maximum, destination);
+    errno = savedErrno;
+    return status == 0;
+}
+
+bool LibraryOwnsSlot(const FreeType::GuestLibrary* library, const FreeType::GuestGlyphSlotRec* slot) {
+    std::array<unsigned char, sizeof(FreeType::GuestLibrary)> probe{};
+    if (!CopyInPreservingErrno(probe.data(), library, probe.size())) {
+        return false;
+    }
+    for (const auto& face : library->faces) {
+        if (&face->slot == slot) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }
@@ -195,10 +231,11 @@ int APS5_VABI sceFreeTypeOtUnknown_qAPXM5DN62Q_nid_no_patch() {
 APS5_EXPORT("qAPXM5DN62Q", sceFreeTypeOtUnknown_qAPXM5DN62Q_nid_no_patch);
 
 int APS5_VABI FT_Render_Glyph_Internal_nid_postfix(FreeType::GuestLibrary* library, FreeType::GuestGlyphSlotRec* slot, std::int32_t renderMode) {
-    if (!library || !slot || !slot->face || slot->library != library) NotImplemented_nid_no_patch(__func__);
-    bool owned = false;
-    for (const auto& face : library->faces) owned = owned || &face->slot == slot;
-    if (!owned) NotImplemented_nid_no_patch(__func__);
+    if (!library || !slot) NotImplemented_nid_no_patch(__func__);
+    FreeType::GuestGlyphSlotRec guestSlot{};
+    if (!CopyInPreservingErrno(&guestSlot, slot, sizeof(guestSlot))) NotImplemented_nid_no_patch(__func__);
+    if (!guestSlot.face || guestSlot.library != library) NotImplemented_nid_no_patch(__func__);
+    if (!LibraryOwnsSlot(library, slot)) NotImplemented_nid_no_patch(__func__);
     return FT_Render_Glyph_nid_postfix(slot, renderMode);
 }
 
@@ -316,11 +353,19 @@ void APS5_VABI FT_Vector_Transform_Scaled_nid_postfix(FreeType::GuestVector* vec
     if (!vector || !matrix) {
         return;
     }
+    FreeType::GuestVector guestVector{};
+    FreeType::GuestMatrix guestMatrix{};
+    if (!CopyInPreservingErrno(&guestVector, vector, sizeof(guestVector)) ||
+        !CopyInPreservingErrno(&guestMatrix, matrix, sizeof(guestMatrix))) {
+        APS5_INVALID_ARG_EX;
+    }
     const FreeType::GuestVector transformed{
-        ScaledSum(vector->x, matrix->xx, vector->y, matrix->xy, divisor, __func__),
-        ScaledSum(vector->x, matrix->yx, vector->y, matrix->yy, divisor, __func__),
+        ScaledSum(guestVector.x, guestMatrix.xx, guestVector.y, guestMatrix.xy, divisor, __func__),
+        ScaledSum(guestVector.x, guestMatrix.yx, guestVector.y, guestMatrix.yy, divisor, __func__),
     };
-    *vector = transformed;
+    if (!CopyOutPreservingErrno(vector, &transformed, sizeof(transformed))) {
+        APS5_INVALID_ARG_EX;
+    }
 }
 
 std::int32_t APS5_VABI FT_SqrtFixed_nid_postfix(std::int32_t x) {
@@ -339,28 +384,56 @@ void APS5_VABI ft_synthesize_vertical_metrics_nid_postfix(FreeType::GuestGlyphMe
     if (!metrics) {
         return;
     }
-    std::int64_t height = metrics->height;
-    if (metrics->horiBearingY < 0) {
-        if (height < metrics->horiBearingY) {
-            height = metrics->horiBearingY;
+    FreeType::GuestGlyphMetrics guestMetrics{};
+    if (!CopyInPreservingErrno(&guestMetrics, metrics, sizeof(guestMetrics))) {
+        APS5_INVALID_ARG_EX;
+    }
+    std::int64_t height = guestMetrics.height;
+    if (guestMetrics.horiBearingY < 0) {
+        if (height < guestMetrics.horiBearingY) {
+            height = guestMetrics.horiBearingY;
         }
-    } else if (metrics->horiBearingY > 0) {
-        height -= metrics->horiBearingY;
+    } else if (guestMetrics.horiBearingY > 0) {
+        height -= guestMetrics.horiBearingY;
     }
     if (!advance) {
         advance = height * 12 / 10;
     }
-    metrics->vertBearingX = metrics->horiBearingX - metrics->horiAdvance / 2;
-    metrics->vertBearingY = (advance - height) / 2;
-    metrics->vertAdvance = advance;
+    guestMetrics.vertBearingX = guestMetrics.horiBearingX - guestMetrics.horiAdvance / 2;
+    guestMetrics.vertBearingY = (advance - height) / 2;
+    guestMetrics.vertAdvance = advance;
+    if (!CopyOutPreservingErrno(metrics, &guestMetrics, sizeof(guestMetrics))) {
+        APS5_INVALID_ARG_EX;
+    }
 }
 
 void* APS5_VABI ft_service_list_lookup_nid_postfix(const GuestServiceDesc* descriptors, const char* service_id) {
-    if (descriptors && service_id) {
-        for (; descriptors->serv_id; ++descriptors) {
-            if (std::strcmp(descriptors->serv_id, service_id) == 0) {
-                return descriptors->serv_data;
-            }
+    if (!descriptors || !service_id) {
+        return nullptr;
+    }
+    std::string targetId;
+    if (!CopyGuestCStringPreservingErrno(service_id, 4096, targetId)) {
+        APS5_INVALID_ARG_EX;
+    }
+    const auto base = reinterpret_cast<std::uintptr_t>(descriptors);
+    for (std::size_t index = 0;; ++index) {
+        if (index > (std::numeric_limits<std::uintptr_t>::max() - base) / sizeof(GuestServiceDesc)) {
+            APS5_INVALID_ARG_EX;
+        }
+        GuestServiceDesc entry{};
+        const auto* current = reinterpret_cast<const GuestServiceDesc*>(base + index * sizeof(GuestServiceDesc));
+        if (!CopyInPreservingErrno(&entry, current, sizeof(entry))) {
+            APS5_INVALID_ARG_EX;
+        }
+        if (!entry.serv_id) {
+            break;
+        }
+        std::string entryId;
+        if (!CopyGuestCStringPreservingErrno(entry.serv_id, 4096, entryId)) {
+            APS5_INVALID_ARG_EX;
+        }
+        if (entryId == targetId) {
+            return entry.serv_data;
         }
     }
     return nullptr;

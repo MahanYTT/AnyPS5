@@ -10,17 +10,21 @@
 #include FT_TYPE1_TABLES_H
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <random>
+#include <stdexcept>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 using FreeType::GuestOutline;
@@ -37,6 +41,10 @@ struct Exports {
     decltype(&FT_Outline_Copy_nid_postfix) copy;
     decltype(&FT_Outline_Decompose_nid_postfix) decompose;
     decltype(&FT_Outline_Get_Bitmap_nid_postfix) outlineBitmap;
+    decltype(&FT_Render_Glyph_Internal_nid_postfix) renderInternal;
+    decltype(&FT_Vector_Transform_Scaled_nid_postfix) vectorTransformScaled;
+    decltype(&ft_synthesize_vertical_metrics_nid_postfix) synthesizeVerticalMetrics;
+    decltype(&ft_service_list_lookup_nid_postfix) serviceListLookup;
 };
 
 struct StrokerExports {
@@ -421,6 +429,142 @@ void Strokers() {
     Require(strokers.finish(library) == 0, "release guest library");
 }
 
+struct GuardedPage {
+    void* base = nullptr;
+    std::size_t size = 0;
+
+    GuardedPage() {
+#ifdef _WIN32
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        size = info.dwPageSize;
+        base = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+        base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) base = nullptr;
+#endif
+        Require(base != nullptr, "allocate guarded page");
+    }
+
+    ~GuardedPage() {
+        if (!base) return;
+#ifdef _WIN32
+        VirtualFree(base, 0, MEM_RELEASE);
+#else
+        munmap(base, size);
+#endif
+    }
+
+    template <typename T> T* As() const { return static_cast<T*>(base); }
+
+    void SetReadOnly() const {
+#ifdef _WIN32
+        DWORD prev = 0;
+        Require(VirtualProtect(base, size, PAGE_READONLY, &prev) != 0, "protect guarded page");
+#else
+        Require(mprotect(base, size, PROT_READ) == 0, "protect guarded page");
+#endif
+    }
+};
+
+template <typename TException, typename TCall>
+bool RejectsPreservingErrno(TCall call) {
+    errno = 71;
+    try {
+        call();
+    } catch (const TException&) {
+        return errno == 71;
+    }
+    return false;
+}
+
+void GuestPointers(bool forwards) {
+    const FreeType::GuestMatrix identity{0x10000, 0, 0, 0x10000};
+    GuestVector vector{100, -200};
+    errno = 71;
+    ot.vectorTransformScaled(&vector, &identity, 1);
+    Require(errno == 71 && vector.x == 100 && vector.y == -200, "FT_Vector_Transform_Scaled preserves errno");
+    auto* const badVector = reinterpret_cast<GuestVector*>(std::uintptr_t{0x10});
+    const auto* const badMatrix = reinterpret_cast<const FreeType::GuestMatrix*>(std::uintptr_t{0x10});
+    Require(RejectsPreservingErrno<std::invalid_argument>([&] { ot.vectorTransformScaled(badVector, &identity, 1); }),
+            "FT_Vector_Transform_Scaled rejects unmapped vector");
+    Require(RejectsPreservingErrno<std::invalid_argument>([&] { ot.vectorTransformScaled(&vector, badMatrix, 1); }) &&
+            vector.x == 100 && vector.y == -200,
+            "FT_Vector_Transform_Scaled rejects unmapped matrix");
+    {
+        GuardedPage page;
+        *page.As<GuestVector>() = GuestVector{10, 20};
+        page.SetReadOnly();
+        Require(RejectsPreservingErrno<std::invalid_argument>([&] { ot.vectorTransformScaled(page.As<GuestVector>(), &identity, 1); }) &&
+                page.As<GuestVector>()->x == 10 && page.As<GuestVector>()->y == 20,
+                "FT_Vector_Transform_Scaled rejects read-only vector");
+    }
+
+    FreeType::GuestGlyphMetrics metrics{100, 200, 10, 50, 80, 0, 0, 0};
+    errno = 71;
+    ot.synthesizeVerticalMetrics(&metrics, 0);
+    Require(errno == 71 && metrics.vertAdvance == 180, "ft_synthesize_vertical_metrics preserves errno");
+    auto* const badMetrics = reinterpret_cast<FreeType::GuestGlyphMetrics*>(std::uintptr_t{0x10});
+    Require(RejectsPreservingErrno<std::invalid_argument>([&] { ot.synthesizeVerticalMetrics(badMetrics, 0); }),
+            "ft_synthesize_vertical_metrics rejects unmapped metrics");
+    {
+        GuardedPage page;
+        *page.As<FreeType::GuestGlyphMetrics>() = FreeType::GuestGlyphMetrics{100, 200, 10, 50, 80, 0, 0, 0};
+        page.SetReadOnly();
+        Require(RejectsPreservingErrno<std::invalid_argument>([&] { ot.synthesizeVerticalMetrics(page.As<FreeType::GuestGlyphMetrics>(), 0); }) &&
+                page.As<FreeType::GuestGlyphMetrics>()->vertAdvance == 0,
+                "ft_synthesize_vertical_metrics rejects read-only metrics");
+    }
+
+    int dataA = 1;
+    const GuestServiceDesc descriptors[]{{"a", &dataA}, {nullptr, nullptr}};
+    errno = 71;
+    Require(ot.serviceListLookup(descriptors, "a") == &dataA && errno == 71, "ft_service_list_lookup preserves errno");
+    const auto* const badDescriptors = reinterpret_cast<const GuestServiceDesc*>(std::uintptr_t{0x10});
+    const auto* const badServiceId = reinterpret_cast<const char*>(std::uintptr_t{0x10});
+    Require(RejectsPreservingErrno<std::invalid_argument>([&] { ot.serviceListLookup(badDescriptors, "a"); }),
+            "ft_service_list_lookup rejects unmapped descriptors");
+    Require(RejectsPreservingErrno<std::invalid_argument>([&] { ot.serviceListLookup(descriptors, badServiceId); }),
+            "ft_service_list_lookup rejects unmapped service_id");
+    const GuestServiceDesc brokenEntry[]{{badServiceId, &dataA}, {nullptr, nullptr}};
+    Require(RejectsPreservingErrno<std::invalid_argument>([&] { ot.serviceListLookup(brokenEntry, "a"); }),
+            "ft_service_list_lookup rejects unmapped descriptor serv_id");
+    errno = 71;
+    Require(ot.serviceListLookup(nullptr, badServiceId) == nullptr && errno == 71,
+            "ft_service_list_lookup returns null for null descriptors");
+    Require(ot.serviceListLookup(badDescriptors, nullptr) == nullptr && errno == 71,
+            "ft_service_list_lookup returns null for null service_id");
+
+    auto* const badLibrary = reinterpret_cast<FreeType::GuestLibrary*>(std::uintptr_t{0x10});
+    auto* const badSlot = reinterpret_cast<FreeType::GuestGlyphSlotRec*>(std::uintptr_t{0x10});
+    Require(RejectsPreservingErrno<std::runtime_error>([&] { ot.renderInternal(badLibrary, badSlot, 0); }),
+            "FT_Render_Glyph_Internal rejects unmapped library and slot");
+    if (forwards) {
+        const std::vector<unsigned char> bytes = SquareGlyphFont('A', 700);
+        FreeType::GuestLibrary* library = nullptr;
+        FreeType::GuestFaceRec* face = nullptr;
+        Require(forwarded.init(&library) == 0 && library != nullptr, "initialize library for renderInternal");
+        Require(forwarded.newMemoryFace(library, bytes.data(), static_cast<std::int64_t>(bytes.size()), 0, &face) == 0 && face && face->glyph,
+                "open face for renderInternal");
+        Require(forwarded.pixelSizes(face, 24, 24) == 0 && forwarded.load(face, 1, FT_LOAD_DEFAULT) == 0,
+                "load glyph for renderInternal");
+        FreeType::GuestGlyphSlotRec* slot = face->glyph;
+        Require(RejectsPreservingErrno<std::runtime_error>([&] { ot.renderInternal(badLibrary, slot, FT_RENDER_MODE_NORMAL); }),
+                "FT_Render_Glyph_Internal rejects unmapped library");
+        Require(RejectsPreservingErrno<std::runtime_error>([&] { ot.renderInternal(library, badSlot, FT_RENDER_MODE_NORMAL); }),
+                "FT_Render_Glyph_Internal rejects unmapped slot");
+        FreeType::GuestGlyphSlotRec crafted = *slot;
+        crafted.library = badLibrary;
+        Require(RejectsPreservingErrno<std::runtime_error>([&] { ot.renderInternal(badLibrary, &crafted, FT_RENDER_MODE_NORMAL); }),
+                "FT_Render_Glyph_Internal rejects matching unmapped library");
+        errno = 71;
+        Require(ot.renderInternal(library, slot, FT_RENDER_MODE_NORMAL) == 0 && errno == 71,
+                "FT_Render_Glyph_Internal preserves errno on success");
+        Require(forwarded.doneFace(face) == 0 && forwarded.finish(library) == 0, "cleanup renderInternal");
+    }
+}
+
 template<class Function>
 void Resolve(Function& function, void* library, bool patched, const char* nid, const char* name) {
     const char* symbol = patched ? nid : name;
@@ -489,6 +633,10 @@ int main(int argc, char** argv) {
     Resolve(ot.orientation, library, patched, "weVsBCT+TTQ", "FT_Outline_Get_Orientation_nid_postfix");
     Resolve(ot.copy, library, patched, "Bhm8Injl0KA", "FT_Outline_Copy_nid_postfix");
     Resolve(ot.decompose, library, patched, "++lgV9pRsO4", "FT_Outline_Decompose_nid_postfix");
+    Resolve(ot.renderInternal, library, patched, "8A0cAU4yBVY", "FT_Render_Glyph_Internal_nid_postfix");
+    Resolve(ot.vectorTransformScaled, library, patched, "PrZtZyFwM6c", "FT_Vector_Transform_Scaled_nid_postfix");
+    Resolve(ot.synthesizeVerticalMetrics, library, patched, "y4Dg0njlwIU", "ft_synthesize_vertical_metrics_nid_postfix");
+    Resolve(ot.serviceListLookup, library, patched, "00MQVzW2OPY", "ft_service_list_lookup_nid_postfix");
     if (forwards) {
         Resolve(strokers.init, library, patched, "GNsiLzm4SH8", "FT_Init_FreeType_nid_postfix");
         Resolve(strokers.finish, library, patched, "dH02CpEEcYk", "FT_Done_FreeType_nid_postfix");
@@ -502,6 +650,7 @@ int main(int argc, char** argv) {
     Trigonometry();
     Outlines();
     if (forwards) Strokers();
+    GuestPointers(forwards);
     std::puts("libSceFreeTypeOt: trigonometry, outline helpers and forwarded exports match FreeType");
     return 0;
 }

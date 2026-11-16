@@ -2,6 +2,7 @@
 #include "prx/libSceFreeTypeOt/include/Outline.hpp"
 
 #include <bit>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,8 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace {
@@ -194,6 +197,88 @@ void HostMemory(const Api& api) {
     api.doneMemory(memory);
 }
 
+struct GuardedPage {
+    void* base = nullptr;
+    std::size_t size = 0;
+
+    GuardedPage() {
+#ifdef _WIN32
+        SYSTEM_INFO info{};
+        GetSystemInfo(&info);
+        size = info.dwPageSize;
+        base = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+        size = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+        base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) base = nullptr;
+#endif
+        Require(base != nullptr, "guarded page allocates");
+    }
+
+    ~GuardedPage() {
+        if (!base) return;
+#ifdef _WIN32
+        VirtualFree(base, 0, MEM_RELEASE);
+#else
+        munmap(base, size);
+#endif
+    }
+
+    template <typename T>
+    T* As() const {
+        return static_cast<T*>(base);
+    }
+
+    void SetReadOnly() const {
+#ifdef _WIN32
+        DWORD previous = 0;
+        Require(VirtualProtect(base, size, PAGE_READONLY, &previous) != 0, "guarded page becomes read-only");
+#else
+        Require(mprotect(base, size, PROT_READ) == 0, "guarded page becomes read-only");
+#endif
+    }
+};
+
+void GuestPointers(const Api& api) {
+    Recorder recorder;
+    Reset(recorder);
+    GuestOutline outline = Sentinel();
+    auto* badMemory = reinterpret_cast<GuestMemoryRec*>(std::uintptr_t{0x10});
+    auto* badOutline = reinterpret_cast<GuestOutline*>(std::uintptr_t{0x10});
+
+    errno = 71;
+    Require(api.newOutline(badMemory, 1, 1, &outline) == 0x06 && Same(outline, Sentinel()) && errno == 71,
+            "newOutline rejects an unmapped memory record without modifying outline or errno");
+    errno = 71;
+    Require(api.newOutline(&recorder.memory, 1, 1, badOutline) == 0x06 && recorder.sizes.empty() && errno == 71,
+            "newOutline rejects an unmapped outline without allocating or modifying errno");
+    errno = 71;
+    Require(api.newOutline(&recorder.memory, 0, 0, badOutline) == 0x06 && recorder.sizes.empty() && errno == 71,
+            "newOutline rejects an unmapped empty outline without modifying errno");
+    errno = 71;
+    Require(api.doneOutline(badMemory, &outline) == 0x06 && Same(outline, Sentinel()) && errno == 71,
+            "doneOutline rejects an unmapped memory record without modifying outline or errno");
+    errno = 71;
+    Require(api.doneOutline(&recorder.memory, badOutline) == 0x06 && recorder.freed.empty() && errno == 71,
+            "doneOutline rejects an unmapped outline without modifying errno");
+
+    GuardedPage page;
+    *page.As<GuestOutline>() = Sentinel();
+    page.SetReadOnly();
+    auto* roOutline = page.As<GuestOutline>();
+    errno = 71;
+    Require(api.newOutline(&recorder.memory, 2, 1, roOutline) == 0x06 && recorder.sizes.empty() && Same(*roOutline, Sentinel()) && errno == 71,
+            "newOutline rejects a read-only outline without allocating or modifying errno");
+    errno = 71;
+    Require(api.doneOutline(&recorder.memory, roOutline) == 0x06 && recorder.freed.empty() && Same(*roOutline, Sentinel()) && errno == 71,
+            "doneOutline rejects a read-only outline without freeing or modifying errno");
+
+    errno = 71;
+    Require(api.newOutline(&recorder.memory, 2, 1, &outline) == 0 && errno == 71, "newOutline preserves errno on success");
+    errno = 71;
+    Require(api.doneOutline(&recorder.memory, &outline) == 0 && errno == 71, "doneOutline preserves errno on success");
+}
+
 template <typename T>
 void Resolve(T& target, void* module, const char* symbol) {
 #ifdef _WIN32
@@ -233,6 +318,7 @@ int main(int count, char** arguments) {
     Failures(api);
     Ownership(api);
     HostMemory(api);
+    GuestPointers(api);
     std::puts("FreeType Ot outline: all checks passed");
     return 0;
 }

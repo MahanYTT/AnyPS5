@@ -6,9 +6,12 @@
 
 #include "prx/libSceFreeTypeOt/include/Polar.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 
 #include <array>
 #include <bit>
+#include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 
@@ -155,6 +158,31 @@ GuestVector Rotated(const GuestVector& vector, std::int64_t angle, const char* f
     return result;
 }
 
+bool CopyIn(void* destination, const void* source, std::size_t bytes) {
+    const int saved = errno;
+    const bool ok = GuestCopyIn_nid_no_patch(destination, source, bytes);
+    errno = saved;
+    return ok;
+}
+
+bool CopyOut(void* destination, const void* source, std::size_t bytes) {
+    const int saved = errno;
+    const bool ok = GuestCopyOut_nid_no_patch(destination, source, bytes);
+    errno = saved;
+    return ok;
+}
+
+bool Writable(void* destination, std::size_t bytes) {
+    const int saved = errno;
+    bool ok = false;
+    {
+        const GuestArena::HostWrite guard(destination, bytes);
+        ok = guard.Open() && GuestWritable_nid_no_patch(destination, bytes);
+    }
+    errno = saved;
+    return ok;
+}
+
 }
 
 namespace FreeType {
@@ -180,15 +208,19 @@ extern "C" {
 
 std::int64_t APS5_VABI sceFreeTypeOtVectorLength_nid_no_patch(GuestVector* vector) {
     if (!vector) NotImplemented_nid_no_patch(__func__);
-    return OtVectorLength(*vector, __func__);
+    GuestVector host{};
+    if (!CopyIn(&host, vector, sizeof(host))) NotImplemented_nid_no_patch(__func__);
+    return OtVectorLength(host, __func__);
 }
 APS5_EXPORT("1jmC2QcpRl0", sceFreeTypeOtVectorLength_nid_no_patch);
 
 void APS5_VABI sceFreeTypeOtVectorPolarize_nid_no_patch(GuestVector* vector, std::int64_t* length, std::int64_t* angle) {
     if (!vector) NotImplemented_nid_no_patch(__func__);
-    if (vector->x == 0 && vector->y == 0) return;
+    GuestVector hostVector{};
+    if (!CopyIn(&hostVector, vector, sizeof(hostVector))) NotImplemented_nid_no_patch(__func__);
+    if (hostVector.x == 0 && hostVector.y == 0) return;
     if (!length || !angle) NotImplemented_nid_no_patch(__func__);
-    const Normalized normalized = Prenorm(*vector, __func__);
+    const Normalized normalized = Prenorm(hostVector, __func__);
     const GuestVector polar = PseudoPolarize(normalized.vector);
     const int shift = normalized.shift;
     const auto finish = [&](bool long64) {
@@ -197,20 +229,28 @@ void APS5_VABI sceFreeTypeOtVectorPolarize_nid_no_patch(GuestVector* vector, std
     };
     const std::int64_t result = finish(false);
     if (result != finish(true)) NotImplemented_nid_no_patch(__func__);
-    *length = result;
-    *angle = polar.y;
+    if (!Writable(length, sizeof(std::int64_t)) || !Writable(angle, sizeof(std::int64_t))) {
+        NotImplemented_nid_no_patch(__func__);
+    }
+    if (!CopyOut(length, &result, sizeof(result)) || !CopyOut(angle, &polar.y, sizeof(polar.y))) {
+        NotImplemented_nid_no_patch(__func__);
+    }
 }
 APS5_EXPORT("HMcNe70D9TI", sceFreeTypeOtVectorPolarize_nid_no_patch);
 
 void APS5_VABI sceFreeTypeOtVectorFromPolar_nid_no_patch(GuestVector* vector, std::int64_t length, std::int64_t angle) {
     if (!vector) NotImplemented_nid_no_patch(__func__);
-    *vector = Rotated({length, 0}, angle, __func__);
+    const GuestVector result = Rotated({length, 0}, angle, __func__);
+    if (!CopyOut(vector, &result, sizeof(result))) NotImplemented_nid_no_patch(__func__);
 }
 APS5_EXPORT("2rmvbvOCyjY", sceFreeTypeOtVectorFromPolar_nid_no_patch);
 
 void APS5_VABI sceFreeTypeOtVectorRotate_nid_no_patch(GuestVector* vector, std::int64_t angle) {
     if (!vector) NotImplemented_nid_no_patch(__func__);
-    *vector = Rotated(*vector, angle, __func__);
+    GuestVector host{};
+    if (!CopyIn(&host, vector, sizeof(host))) NotImplemented_nid_no_patch(__func__);
+    const GuestVector result = Rotated(host, angle, __func__);
+    if (!CopyOut(vector, &result, sizeof(result))) NotImplemented_nid_no_patch(__func__);
 }
 APS5_EXPORT("6wJwUIVwAxg", sceFreeTypeOtVectorRotate_nid_no_patch);
 

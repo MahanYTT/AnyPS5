@@ -9,6 +9,8 @@
 #include "prx/libc/include/General.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -24,6 +26,20 @@ constexpr int InvalidArgument = 0x06;
 constexpr int OrientationTrueType = 0;
 constexpr int OrientationPostScript = 1;
 constexpr int OrientationNone = 2;
+
+bool CopyIn(void* destination, const void* source, std::size_t bytes) {
+    const int saved = errno;
+    const bool ok = GuestCopyIn_nid_no_patch(destination, source, bytes);
+    errno = saved;
+    return ok;
+}
+
+bool CopyOut(void* destination, const void* source, std::size_t bytes) {
+    const int saved = errno;
+    const bool ok = GuestCopyOut_nid_no_patch(destination, source, bytes);
+    errno = saved;
+    return ok;
+}
 
 std::uint64_t Magnitude(std::int64_t value) {
     return value < 0 ? 0 - static_cast<std::uint64_t>(value) : static_cast<std::uint64_t>(value);
@@ -71,10 +87,7 @@ std::int64_t Mul(std::int64_t a, std::int64_t b, const char* function) {
 
 class Points {
 public:
-    Points(const GuestOutline& outline, const char* function) : function(function) {
-        const auto count = static_cast<std::int16_t>(outline.n_points);
-        if (count > 0 && outline.points) points.assign(outline.points, outline.points + count);
-    }
+    Points(std::vector<GuestVector> points, const char* function) : function(function), points(std::move(points)) {}
 
     GuestVector& operator[](int index) {
         if (index < 0 || static_cast<std::size_t>(index) >= points.size()) NotImplemented_nid_no_patch(function);
@@ -90,18 +103,32 @@ private:
     std::vector<GuestVector> points;
 };
 
-int Contour(const GuestOutline& outline, int index, const char* function) {
-    if (!outline.contours) NotImplemented_nid_no_patch(function);
-    return static_cast<std::int16_t>(outline.contours[index]);
+bool ReadPoints(const GuestOutline& outline, std::vector<GuestVector>& points) {
+    const auto count = static_cast<std::int16_t>(outline.n_points);
+    if (count <= 0 || !outline.points) return true;
+    points.resize(static_cast<std::size_t>(count));
+    return CopyIn(points.data(), outline.points, points.size() * sizeof(GuestVector));
 }
 
-int Orientation(const GuestOutline& outline, Points& points, const char* function) {
+bool ReadContours(const GuestOutline& outline, std::vector<std::uint16_t>& contours) {
+    const auto count = static_cast<std::int16_t>(outline.n_contours);
+    if (count <= 0 || !outline.contours) return true;
+    contours.resize(static_cast<std::size_t>(count));
+    return CopyIn(contours.data(), outline.contours, contours.size() * sizeof(std::uint16_t));
+}
+
+int Contour(const std::vector<std::uint16_t>& contours, int index, const char* function) {
+    if (index < 0 || static_cast<std::size_t>(index) >= contours.size()) NotImplemented_nid_no_patch(function);
+    return static_cast<std::int16_t>(contours[static_cast<std::size_t>(index)]);
+}
+
+int Orientation(const GuestOutline& outline, Points& points, const std::vector<std::uint16_t>& contoursList, const char* function) {
     if (static_cast<std::int16_t>(outline.n_points) <= 0) return OrientationTrueType;
     std::int64_t area = 0;
     int first = 0;
     const int contours = static_cast<std::int16_t>(outline.n_contours);
     for (int c = 0; c < contours; ++c) {
-        const int last = Contour(outline, c, function);
+        const int last = Contour(contoursList, c, function);
         GuestVector previous = points[last];
         for (int n = first; n <= last; ++n) {
             const GuestVector current = points[n];
@@ -121,31 +148,48 @@ extern "C" {
 
 void APS5_VABI sceFreeTypeOtOutlineTransform_nid_no_patch(const GuestOutline* outline, const GuestMatrix* matrix) {
     if (!outline || !matrix) return;
-    const auto count = static_cast<std::int16_t>(outline->n_points);
-    if (count <= 0) return;
-    if (!outline->points) NotImplemented_nid_no_patch(__func__);
-    std::vector<GuestVector> transformed(static_cast<std::size_t>(count));
-    for (std::int16_t i = 0; i < count; ++i) {
-        const GuestVector& point = outline->points[i];
-        transformed[i] = {MulFix(point.x, matrix->xx, __func__) + MulFix(point.y, matrix->xy, __func__),
-                          MulFix(point.x, matrix->yx, __func__) + MulFix(point.y, matrix->yy, __func__)};
+    GuestOutline hostOutline{};
+    GuestMatrix hostMatrix{};
+    if (!CopyIn(&hostOutline, outline, sizeof(hostOutline)) || !CopyIn(&hostMatrix, matrix, sizeof(hostMatrix))) {
+        NotImplemented_nid_no_patch(__func__);
     }
-    std::copy(transformed.begin(), transformed.end(), outline->points);
+    const auto count = static_cast<std::int16_t>(hostOutline.n_points);
+    if (count <= 0) return;
+    if (!hostOutline.points) NotImplemented_nid_no_patch(__func__);
+    std::vector<GuestVector> source(static_cast<std::size_t>(count));
+    if (!CopyIn(source.data(), hostOutline.points, source.size() * sizeof(GuestVector))) {
+        NotImplemented_nid_no_patch(__func__);
+    }
+    std::vector<GuestVector> transformed(source.size());
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        const GuestVector& point = source[i];
+        transformed[i] = {MulFix(point.x, hostMatrix.xx, __func__) + MulFix(point.y, hostMatrix.xy, __func__),
+                          MulFix(point.x, hostMatrix.yx, __func__) + MulFix(point.y, hostMatrix.yy, __func__)};
+    }
+    if (!CopyOut(hostOutline.points, transformed.data(), transformed.size() * sizeof(GuestVector))) {
+        NotImplemented_nid_no_patch(__func__);
+    }
 }
 APS5_EXPORT("0Lv6K1d47jg", sceFreeTypeOtOutlineTransform_nid_no_patch);
 
 int APS5_VABI sceFreeTypeOtOutlineEmboldenXY_nid_no_patch(GuestOutline* outline, std::int64_t xstrength, std::int64_t ystrength) {
     if (!outline) return InvalidArgument;
+    GuestOutline hostOutline{};
+    if (!CopyIn(&hostOutline, outline, sizeof(hostOutline))) return InvalidArgument;
     xstrength /= 2;
     ystrength /= 2;
     if (xstrength == 0 && ystrength == 0) return 0;
-    Points points(*outline, __func__);
-    const int orientation = Orientation(*outline, points, __func__);
-    const int contours = static_cast<std::int16_t>(outline->n_contours);
+    std::vector<GuestVector> rawPoints;
+    if (!ReadPoints(hostOutline, rawPoints)) return InvalidArgument;
+    std::vector<std::uint16_t> contoursList;
+    if (!ReadContours(hostOutline, contoursList)) return InvalidArgument;
+    Points points(std::move(rawPoints), __func__);
+    const int orientation = Orientation(hostOutline, points, contoursList, __func__);
+    const int contours = static_cast<std::int16_t>(hostOutline.n_contours);
     if (orientation == OrientationNone) return contours != 0 ? InvalidArgument : 0;
     int first = 0;
     for (int c = 0; c < contours; ++c) {
-        const int last = Contour(*outline, c, __func__);
+        const int last = Contour(contoursList, c, __func__);
         const GuestVector vFirst = points[first];
         const GuestVector vPrev = points[last];
         GuestVector vCur = vFirst;
@@ -179,7 +223,9 @@ int APS5_VABI sceFreeTypeOtOutlineEmboldenXY_nid_no_patch(GuestOutline* outline,
         }
         first = last + 1;
     }
-    std::copy(points.All().begin(), points.All().end(), outline->points);
+    if (!points.All().empty() && !CopyOut(hostOutline.points, points.All().data(), points.All().size() * sizeof(GuestVector))) {
+        return InvalidArgument;
+    }
     return 0;
 }
 APS5_EXPORT("BgUMBGvhATU", sceFreeTypeOtOutlineEmboldenXY_nid_no_patch);

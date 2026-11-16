@@ -8,36 +8,86 @@
 #include "prx/libSceFreeTypeOt/include/Memory.hpp"
 #include "prx/libc/include/General.hpp"
 
+#include <cerrno>
+#include <cstddef>
 #include <cstdint>
 
 using namespace FreeType;
 
 namespace {
 
-GuestSlotInternalRec* Internal(GuestGlyphSlotRec* slot) {
-    return static_cast<GuestSlotInternalRec*>(slot->internal);
+bool CopyInPreservingErrno(void* destination, const void* source, std::size_t bytes) {
+    const int savedErrno = errno;
+    const bool ok = GuestCopyIn_nid_no_patch(destination, source, bytes);
+    errno = savedErrno;
+    return ok;
 }
 
-GuestMemoryRec* FaceMemory(GuestGlyphSlotRec* slot, const char* function) {
-    if (!slot->face) NotImplemented_nid_no_patch(function);
-    return static_cast<GuestMemoryRec*>(static_cast<GuestFaceRec*>(slot->face)->memory);
+bool CopyOutPreservingErrno(void* destination, const void* source, std::size_t bytes) {
+    const int savedErrno = errno;
+    const bool ok = GuestCopyOut_nid_no_patch(destination, source, bytes);
+    errno = savedErrno;
+    return ok;
 }
 
-void FreeOwned(GuestMemoryRec* memory, GuestGlyphSlotRec* slot, const char* function) {
-    if (slot->bitmap.buffer && !memory) NotImplemented_nid_no_patch(function);
-    ft_mem_free_nid_postfix(memory, slot->bitmap.buffer);
-    slot->bitmap.buffer = nullptr;
+bool WritablePreservingErrno(void* destination, std::size_t bytes) {
+    const int savedErrno = errno;
+    const bool ok = GuestWritable_nid_no_patch(destination, bytes);
+    errno = savedErrno;
+    return ok;
+}
+
+unsigned char** SlotBitmapBufferField(GuestGlyphSlotRec* slot) {
+    return &slot->bitmap.buffer;
+}
+
+GuestMemoryRec* FaceMemory(const GuestGlyphSlotRec& slot, const char* function) {
+    if (!slot.face) NotImplemented_nid_no_patch(function);
+    GuestMemoryRec* memory = nullptr;
+    const auto* face = static_cast<const GuestFaceRec*>(slot.face);
+    if (!CopyInPreservingErrno(&memory, &face->memory, sizeof(memory))) NotImplemented_nid_no_patch(function);
+    return memory;
+}
+
+void WriteSlotBitmapBuffer(GuestGlyphSlotRec* slot, unsigned char* buffer, const char* function) {
+    if (!CopyOutPreservingErrno(SlotBitmapBufferField(slot), &buffer, sizeof(buffer))) {
+        NotImplemented_nid_no_patch(function);
+    }
+}
+
+void WriteInternalFlags(GuestSlotInternalRec* internal, std::uint32_t flags, const char* function) {
+    if (!CopyOutPreservingErrno(&internal->flags, &flags, sizeof(flags))) {
+        NotImplemented_nid_no_patch(function);
+    }
+}
+
+void FreeOwned(GuestMemoryRec* memory, GuestGlyphSlotRec* slot, GuestGlyphSlotRec& guestSlot, const char* function) {
+    if (guestSlot.bitmap.buffer && !memory) NotImplemented_nid_no_patch(function);
+    ft_mem_free_nid_postfix(memory, guestSlot.bitmap.buffer);
+    guestSlot.bitmap.buffer = nullptr;
+    WriteSlotBitmapBuffer(slot, nullptr, function);
 }
 
 void FreeBitmap(GuestGlyphSlotRec* slot, const char* function) {
     if (!slot) NotImplemented_nid_no_patch(function);
-    GuestSlotInternalRec* internal = Internal(slot);
-    if (internal && (internal->flags & GlyphOwnBitmap)) {
-        FreeOwned(FaceMemory(slot, function), slot, function);
-        internal->flags &= ~GlyphOwnBitmap;
-    } else {
-        slot->bitmap.buffer = nullptr;
+    GuestGlyphSlotRec guestSlot{};
+    if (!CopyInPreservingErrno(&guestSlot, slot, sizeof(guestSlot))) NotImplemented_nid_no_patch(function);
+    auto* internal = static_cast<GuestSlotInternalRec*>(guestSlot.internal);
+    if (internal) {
+        GuestSlotInternalRec guestInternal{};
+        if (!CopyInPreservingErrno(&guestInternal, internal, sizeof(guestInternal))) NotImplemented_nid_no_patch(function);
+        if (guestInternal.flags & GlyphOwnBitmap) {
+            unsigned char** slotBuffer = SlotBitmapBufferField(slot);
+            if (!WritablePreservingErrno(slotBuffer, sizeof(*slotBuffer)) ||
+                !WritablePreservingErrno(&internal->flags, sizeof(internal->flags))) {
+                NotImplemented_nid_no_patch(function);
+            }
+            FreeOwned(FaceMemory(guestSlot, function), slot, guestSlot, function);
+            WriteInternalFlags(internal, guestInternal.flags & ~GlyphOwnBitmap, function);
+            return;
+        }
     }
+    WriteSlotBitmapBuffer(slot, nullptr, function);
 }
 
 }
@@ -49,24 +99,39 @@ void APS5_VABI ft_glyphslot_free_bitmap_nid_postfix(GuestGlyphSlotRec* slot) {
 }
 
 void APS5_VABI ft_glyphslot_set_bitmap_nid_postfix(GuestGlyphSlotRec* slot, std::uint8_t* buffer) {
-    FreeBitmap(slot, __func__);
-    slot->bitmap.buffer = buffer;
+    const char* function = __func__;
+    FreeBitmap(slot, function);
+    WriteSlotBitmapBuffer(slot, buffer, function);
 }
 
 int APS5_VABI ft_glyphslot_alloc_bitmap_nid_postfix(GuestGlyphSlotRec* slot, std::uint64_t size) {
     const char* function = __func__;
-    if (!slot || !slot->internal) NotImplemented_nid_no_patch(function);
-    GuestMemoryRec* memory = FaceMemory(slot, function);
-    GuestSlotInternalRec* internal = Internal(slot);
-    if (internal->flags & GlyphOwnBitmap) {
-        FreeOwned(memory, slot, function);
+    if (!slot) NotImplemented_nid_no_patch(function);
+    GuestGlyphSlotRec guestSlot{};
+    if (!CopyInPreservingErrno(&guestSlot, slot, sizeof(guestSlot))) NotImplemented_nid_no_patch(function);
+    auto* internal = static_cast<GuestSlotInternalRec*>(guestSlot.internal);
+    if (!internal) NotImplemented_nid_no_patch(function);
+    GuestSlotInternalRec guestInternal{};
+    if (!CopyInPreservingErrno(&guestInternal, internal, sizeof(guestInternal))) NotImplemented_nid_no_patch(function);
+    GuestMemoryRec* memory = FaceMemory(guestSlot, function);
+    unsigned char** slotBuffer = SlotBitmapBufferField(slot);
+    if (!WritablePreservingErrno(slotBuffer, sizeof(*slotBuffer)) ||
+        !WritablePreservingErrno(&internal->flags, sizeof(internal->flags))) {
+        NotImplemented_nid_no_patch(function);
+    }
+    if (guestInternal.flags & GlyphOwnBitmap) {
+        FreeOwned(memory, slot, guestSlot, function);
     } else {
-        internal->flags |= GlyphOwnBitmap;
+        WriteInternalFlags(internal, guestInternal.flags | GlyphOwnBitmap, function);
     }
     const auto bytes = static_cast<std::int64_t>(size);
     if (bytes > 0 && !memory) NotImplemented_nid_no_patch(function);
     std::int32_t error = 0;
-    slot->bitmap.buffer = static_cast<unsigned char*>(ft_mem_alloc_nid_postfix(memory, bytes, &error));
+    auto* buffer = static_cast<unsigned char*>(ft_mem_alloc_nid_postfix(memory, bytes, &error));
+    if (!CopyOutPreservingErrno(slotBuffer, &buffer, sizeof(buffer))) {
+        if (buffer) ft_mem_free_nid_postfix(memory, buffer);
+        NotImplemented_nid_no_patch(function);
+    }
     return error;
 }
 
